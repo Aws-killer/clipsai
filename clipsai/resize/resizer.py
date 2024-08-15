@@ -699,40 +699,13 @@ class Resizer:
         """
         fps = video_file.get_frame_rate()
 
-        # define frames to analyze from each segment
-        detect_secs = []
-        for segment in segments:
-            if segment["found_face"] is False:
-                continue
-            # define interval over which to analyze faces
-            end_time = segment["end_time"]
-            first_face_sec = segment["first_face_sec"]
-            analyze_end_time = end_time - (end_time - first_face_sec) / 8
-            # get sample locations
-            frames_left = int((analyze_end_time - first_face_sec) * fps + 1)
-            num_samples = min(frames_left, samples_per_segment)
-            segment["num_samples"] = num_samples
-            # add first face, sample the rest
-            detect_secs.append(first_face_sec)
-            sample_frames = np.sort(
-                np.random.choice(range(1, frames_left), num_samples - 1, replace=False)
-            )
-            for sample_frame in sample_frames:
-                detect_secs.append(first_face_sec + sample_frame / fps)
-
-        # detect faces from each segment
-        logging.debug("Extracting {} frames".format(len(detect_secs)))
-        frames = extract_frames(video_file, detect_secs)
-        logging.debug("Extracted {} frames".format(len(detect_secs)))
-        face_detections = self._detect_faces(frames, face_detect_width)
-
         logging.debug("Calculating ROI for {} segments.".format(len(segments)))
         # find roi for each segment
         idx = 0
         for segment in segments:
             # find segment roi
             if segment["found_face"] is True:
-                roi = self._calc_segment_roi(
+                rois = self._calc_segment_rois(
                     frames=frames[idx : idx + segment["num_samples"]],
                     face_detections=face_detections[idx : idx + segment["num_samples"]],
                 )
@@ -740,22 +713,121 @@ class Resizer:
                 del segment["num_samples"]
             else:
                 logging.debug("Using default ROI for segment {}".format(segment))
-                roi = Rect(
+                rois = [Rect(
                     x=(video_file.get_width_pixels()) // 4,
                     y=(video_file.get_height_pixels()) // 4,
                     width=(video_file.get_width_pixels()) // 2,
                     height=(video_file.get_height_pixels()) // 2,
-                )
+                )]
             del segment["found_face"]
             del segment["first_face_sec"]
 
             # add crop coordinates to segment
-            crop = self._calc_crop(roi, resize_width, resize_height)
-            segment["x"] = int(crop.x)
-            segment["y"] = int(crop.y)
+            if len(rois) == 1:
+                crop = self._calc_crop(rois[0], resize_width, resize_height)
+                segment["x"] = int(crop.x)
+                segment["y"] = int(crop.y)
+                segment["crop_type"] = "single"
+            elif len(rois) > 1:
+                segment["crops"] = self._calc_split_screen_crops(rois, resize_width, resize_height)
+                segment["crop_type"] = "split"
+            else:
+                # Fallback to center crop if no ROIs found
+                segment["x"] = (video_file.get_width_pixels() - resize_width) // 2
+                segment["y"] = (video_file.get_height_pixels() - resize_height) // 2
+                segment["crop_type"] = "single"
+
         logging.debug("Calculated ROI for {} segments.".format(len(segments)))
 
         return segments
+
+    def _calc_segment_rois(
+        self,
+        frames: list[np.ndarray],
+        face_detections: list[np.ndarray],
+    ) -> list[Rect]:
+        # Similar to _calc_segment_roi, but returns a list of ROIs
+        rois = []
+        for face_detection in face_detections:
+            if face_detection is not None:
+                for bbox in face_detection:
+                    x1, y1, x2, y2 = bbox[:4]
+                    rois.append(Rect(x1, y1, x2 - x1, y2 - y1))
+        
+        # Merge overlapping ROIs
+        return self.merge_rois(rois)
+
+    def merge_rois(self, rois: list[Rect], overlap_threshold: float = 0.5) -> list[Rect]:
+        merged = []
+        while rois:
+            roi = rois.pop(0)
+            i = 0
+            while i < len(rois):
+                if self.iou(roi, rois[i]) > overlap_threshold:
+                    roi = self.union_rois(roi, rois.pop(i))
+                else:
+                    i += 1
+            merged.append(roi)
+        return merged
+
+    @staticmethod
+    def iou(rect1: Rect, rect2: Rect) -> float:
+        x1 = max(rect1.x, rect2.x)
+        y1 = max(rect1.y, rect2.y)
+        x2 = min(rect1.x + rect1.width, rect2.x + rect2.width)
+        y2 = min(rect1.y + rect1.height, rect2.y + rect2.height)
+        
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        union = rect1.width * rect1.height + rect2.width * rect2.height - intersection
+        
+        return intersection / union if union > 0 else 0
+
+    @staticmethod
+    def union_rois(rect1: Rect, rect2: Rect) -> Rect:
+        x = min(rect1.x, rect2.x)
+        y = min(rect1.y, rect2.y)
+        width = max(rect1.x + rect1.width, rect2.x + rect2.width) - x
+        height = max(rect1.y + rect1.height, rect2.y + rect2.height) - y
+        return Rect(x, y, width, height)
+
+    def _calc_split_screen_crops(
+        self,
+        rois: list[Rect],
+        resize_width: int,
+        resize_height: int,
+    ) -> list[dict]:
+        crops = []
+        n_rois = len(rois)
+        
+        if n_rois == 2:
+            # For two ROIs, split the screen vertically
+            for i, roi in enumerate(rois):
+                crop = self._calc_crop(roi, resize_width, resize_height // 2)
+                crops.append({
+                    "x": int(crop.x),
+                    "y": int(crop.y),
+                    "width": resize_width,
+                    "height": resize_height // 2,
+                    "target_y": i * (resize_height // 2)
+                })
+        elif n_rois > 2:
+            # For more than two ROIs, use a grid layout
+            grid_size = math.ceil(math.sqrt(n_rois))
+            cell_width = resize_width // grid_size
+            cell_height = resize_height // grid_size
+            
+            for i, roi in enumerate(rois):
+                crop = self._calc_crop(roi, cell_width, cell_height)
+                crops.append({
+                    "x": int(crop.x),
+                    "y": int(crop.y),
+                    "width": cell_width,
+                    "height": cell_height,
+                    "target_x": (i % grid_size) * cell_width,
+                    "target_y": (i // grid_size) * cell_height
+                })
+        
+        return crops
 
     def _calc_segment_roi(
         self,
