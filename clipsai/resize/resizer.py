@@ -7,7 +7,7 @@ Notes
 """
 # standard library imports
 import logging
-
+import math
 # current package imports
 from .crops import Crops
 from .exceptions import ResizerError
@@ -171,18 +171,34 @@ class Resizer:
                 unmerge_segments_length - len(segments)
             )
         )
-
         crop_segments = []
         for segment in segments:
-            crop_segments.append(
-                Segment(
-                    speakers=segment["speakers"],
-                    start_time=segment["start_time"],
-                    end_time=segment["end_time"],
-                    x=segment["x"],
-                    y=segment["y"],
+            if segment['crop_type'] == 'single':
+                crop_segments.append(
+                    Segment(
+                        speakers=segment["speakers"],
+                        start_time=segment["start_time"],
+                        end_time=segment["end_time"],
+                        x=segment["x"],
+                        y=segment["y"],
+                    )
                 )
-            )
+            elif segment['crop_type'] == 'split':
+                # For split-screen segments, we'll create a Segment for each crop
+                for crop in segment['crops']:
+                    crop_segments.append(
+                        Segment(
+                            speakers=segment["speakers"],
+                            start_time=segment["start_time"],
+                            end_time=segment["end_time"],
+                            x=crop["x"],
+                            y=crop["y"],
+                            width=crop["width"],
+                            height=crop["height"],
+                            target_x=crop["target_x"],
+                            target_y=crop["target_y"],
+                        )
+                    )
 
         crops = Crops(
             original_width=video_file.get_width_pixels(),
@@ -193,6 +209,9 @@ class Resizer:
         )
 
         return crops
+
+
+
 
     def _calc_resize_width_and_height_pixels(
         self,
@@ -699,6 +718,36 @@ class Resizer:
         """
         fps = video_file.get_frame_rate()
 
+        # define frames to analyze from each segment
+        detect_secs = []
+        for segment in segments:
+            if segment["found_face"] is False:
+                continue
+            # define interval over which to analyze faces
+            end_time = segment["end_time"]
+            first_face_sec = segment["first_face_sec"]
+            analyze_end_time = end_time - (end_time - first_face_sec) / 8
+            # get sample locations
+            frames_left = int((analyze_end_time - first_face_sec) * fps + 1)
+            num_samples = min(frames_left, samples_per_segment)
+            segment["num_samples"] = num_samples
+            # add first face, sample the rest
+            detect_secs.append(first_face_sec)
+            sample_frames = np.sort(
+                np.random.choice(range(1, frames_left), num_samples - 1, replace=False)
+            )
+            for sample_frame in sample_frames:
+                detect_secs.append(first_face_sec + sample_frame / fps)
+
+        # detect faces from each segment
+        logging.debug("Extracting {} frames".format(len(detect_secs)))
+        frames = extract_frames(video_file, detect_secs)
+        logging.debug("Extracted {} frames".format(len(detect_secs)))
+        face_detections = self._detect_faces(frames, face_detect_width)
+
+        logging.debug("Calculating ROI for {} segments.".format(len(segments)))
+
+
         logging.debug("Calculating ROI for {} segments.".format(len(segments)))
         # find roi for each segment
         idx = 0
@@ -1053,10 +1102,14 @@ class Resizer:
                 the start time of the segment
             end_time: float
                 the end time of the segment
-            x: int
+            crop_type: str
+                'single' for single person crop, 'split' for split screen
+            x: int (for single crop)
                 x-coordinate of the top left corner of the resized segment
-            y: int
+            y: int (for single crop)
                 y-coordinate of the top left corner of the resized segment
+            crops: list[dict] (for split screen)
+                list of crop information for each part of the split screen
         video_file: VideoFile
             The video file that the segments are from
 
@@ -1070,31 +1123,57 @@ class Resizer:
         video_width = video_file.get_width_pixels()
         video_height = video_file.get_height_pixels()
 
-        for _ in range(len(segments) - 1):
-            cur_x = segments[idx]["x"]
-            next_x = segments[idx + 1]["x"]
-            x_diff = abs(cur_x - next_x)
-            if (x_diff / video_width) < max_position_difference_ratio:
-                same_x = True
-                segments[idx]["x"] = int((cur_x + next_x) // 2)
-            else:
-                same_x = False
+        while idx < len(segments) - 1:
+            current_segment = segments[idx]
+            next_segment = segments[idx + 1]
 
-            curr_y = segments[idx]["y"]
-            next_y = segments[idx + 1]["y"]
-            y_diff = abs(curr_y - next_y)
-            if (y_diff / video_height) < max_position_difference_ratio:
-                same_y = True
-                segments[idx]["y"] = int((curr_y + next_y) // 2)
-            else:
-                same_y = False
-
-            if same_x and same_y:
-                segments[idx]["end_time"] = segments[idx + 1]["end_time"]
-                segments = segments[: idx + 1] + segments[idx + 2 :]
-            else:
+            if current_segment['crop_type'] != next_segment['crop_type']:
                 idx += 1
+                continue
+
+            if current_segment['crop_type'] == 'single':
+                if self._are_single_crops_similar(current_segment, next_segment, video_width, video_height, max_position_difference_ratio):
+                    self._merge_single_crop_segments(current_segment, next_segment)
+                    segments.pop(idx + 1)
+                else:
+                    idx += 1
+            elif current_segment['crop_type'] == 'split':
+                if self._are_split_crops_similar(current_segment['crops'], next_segment['crops'], video_width, video_height, max_position_difference_ratio):
+                    self._merge_split_crop_segments(current_segment, next_segment)
+                    segments.pop(idx + 1)
+                else:
+                    idx += 1
+            else:
+                # Unknown crop type, move to next segment
+                idx += 1
+
         return segments
+
+    def _are_single_crops_similar(self, segment1, segment2, video_width, video_height, max_diff_ratio):
+        x_diff = abs(segment1['x'] - segment2['x']) / video_width
+        y_diff = abs(segment1['y'] - segment2['y']) / video_height
+        return x_diff < max_diff_ratio and y_diff < max_diff_ratio
+
+    def _are_split_crops_similar(self, crops1, crops2, video_width, video_height, max_diff_ratio):
+        if len(crops1) != len(crops2):
+            return False
+        for crop1, crop2 in zip(crops1, crops2):
+            x_diff = abs(crop1['x'] - crop2['x']) / video_width
+            y_diff = abs(crop1['y'] - crop2['y']) / video_height
+            if x_diff >= max_diff_ratio or y_diff >= max_diff_ratio:
+                return False
+        return True
+
+    def _merge_single_crop_segments(self, segment1, segment2):
+        segment1['x'] = (segment1['x'] + segment2['x']) // 2
+        segment1['y'] = (segment1['y'] + segment2['y']) // 2
+        segment1['end_time'] = segment2['end_time']
+
+    def _merge_split_crop_segments(self, segment1, segment2):
+        for crop1, crop2 in zip(segment1['crops'], segment2['crops']):
+            crop1['x'] = (crop1['x'] + crop2['x']) // 2
+            crop1['y'] = (crop1['y'] + crop2['y']) // 2
+        segment1['end_time'] = segment2['end_time']    
 
     def cleanup(self) -> None:
         """
